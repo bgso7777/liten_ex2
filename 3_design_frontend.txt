@@ -61,9 +61,8 @@ Column
 │           ├── Title: 노트 제목 + 파일 수 배지
 │           ├── Subtitle: 내용 미리보기
 │           └── Trailing: 날짜 + 삭제 버튼
-├── 사용량 인디케이터 (UsageIndicator) - 무료 사용자만
 └── 하단 고정 버튼: "리튼 생성" FloatingActionButton
-    └── onPressed: _checkNoteLimit() 후 생성 또는 제한 다이얼로그
+    └── onPressed: 리튼 생성 다이얼로그
 
 3.1.2 노트 목록 아이템 UI
 ListTile
@@ -96,7 +95,7 @@ Column
 │   └── ListView.builder
 │       └── 듣기 파일 카드
 └── 하단 듣기 컨트롤 패널
-    ├── 듣기 시작 버튼 (onPressed: _checkFileLimit('recording'))
+    ├── 듣기 시작 버튼 (onPressed: 듣기 시작)
     ├── 듣기 중지 버튼
     └── 듣기 상태 표시
 
@@ -141,12 +140,13 @@ Row
 3.3.1 전체 레이아웃 구조
 Column
 ├── AdBanner (무료 사용자만, height: 50)
+├── 음성-쓰기 동기화 상태 표시 (AudioSyncIndicator)
 ├── 모드 선택 탭바 (텍스트 쓰기 / 필기)
 ├── 현재 모드에 따른 화면 표시
 │   ├── 텍스트 쓰기 모드 → 3.3.2
 │   └── 필기 모드 → 3.3.3
 └── 저장 버튼
-    └── onPressed: _checkFileLimit('writing') 후 저장 또는 제한 다이얼로그
+    └── onPressed: 텍스트 저장
 
 3.3.2 텍스트 쓰기 모드 (TextWritingMode)
 
@@ -225,11 +225,12 @@ Positioned(bottom: 0)
     ├── decoration: BoxDecoration(color: Colors.white, boxShadow)
     └── Column
         ├── HandwritingToolbar() // 상단 도구바
+        ├── AudioTimestampMarker() // 음성 시간 마커 (동기화 활성 시)
         └── HandwritingColorPalette() // 하단 색상 팔레트
 
 3.3.4.4 필기 파일 추가 UI
 FloatingActionButton ("+" 버튼)
-└── onPressed: _checkFileLimit('writing') 후 파일 선택 또는 제한 다이얼로그
+└── onPressed: 파일 선택 다이얼로그
 
 3.5 설정 화면 (SettingsScreen)
 
@@ -319,45 +320,9 @@ AppBar
         ├── 듣기 파일 수 배지
         └── 쓰기 파일 수 배지
 
-4.2 무료/유료 제한 관리 UI 컴포넌트
+4.2 프리미엄 관련 UI 컴포넌트
 
-4.2.1 제한 경고 다이얼로그 (LimitWarningDialog)
-AlertDialog
-├── title: Row
-│   ├── Icon(Icons.warning, color: Colors.orange)
-│   ├── SizedBox(width: 8)
-│   └── Text("사용 제한 도달")
-├── content: Column
-│   ├── Text("무료 계정 제한에 도달했습니다:")
-│   ├── SizedBox(height: 12)
-│   ├── 제한 현황 표시: Column
-│   │   ├── Row: "리튼: 3/3개 사용중"
-│   │   ├── Row: "음성 파일: 5/5개 사용중"
-│   │   └── Row: "쓰기 파일: 5/5개 사용중"
-│   ├── SizedBox(height: 16)
-│   └── Text("계속 사용하려면 프리미엄으로 업그레이드하거나\n기존 파일을 삭제해주세요.")
-└── actions: Row
-    ├── TextButton("기존 파일 삭제", onPressed: _showDeleteDialog)
-    ├── SizedBox(width: 8)
-    └── ElevatedButton("프리미엄 업그레이드", onPressed: _showUpgradeDialog)
-
-4.2.2 파일 삭제 선택 다이얼로그 (FileDeleteDialog)
-AlertDialog
-├── title: Text("삭제할 파일 선택")
-├── content: Container
-│   ├── height: 300
-│   └── ListView.builder
-│       └── CheckboxListTile
-│           ├── value: 선택 상태
-│           ├── title: 파일명
-│           ├── subtitle: 날짜 + 크기
-│           └── secondary: 파일 타입 아이콘
-└── actions: Row
-    ├── TextButton("취소")
-    ├── SizedBox(width: 8)
-    └── ElevatedButton("삭제하기 (N개)")
-
-4.2.3 프리미엄 업그레이드 다이얼로그 (UpgradeDialog)
+4.2.1 프리미엄 업그레이드 다이얼로그 (UpgradeDialog)
 AlertDialog
 ├── title: Row
 │   ├── Icon(Icons.star, color: Colors.amber)
@@ -367,11 +332,9 @@ AlertDialog
 │   ├── Text("프리미엄 혜택:", style: 굵은 글씨)
 │   ├── SizedBox(height: 12)
 │   ├── 혜택 목록: Column
-│   │   ├── Row: "✓ 무제한 리튼 생성"
-│   │   ├── Row: "✓ 무제한 파일 저장"
 │   │   ├── Row: "✓ 광고 완전 제거"
 │   │   ├── Row: "✓ 클라우드 동기화"
-│   │   └── Row: "✓ PC에서도 사용 가능"
+│   │   └── Row: "✓ PC/웹에서 사용 가능"
 │   ├── SizedBox(height: 16)
 │   ├── 가격 표시: Container
 │   │   ├── decoration: 테두리 + 배경색
@@ -384,39 +347,6 @@ AlertDialog
     ├── SizedBox(width: 8)
     └── ElevatedButton("지금 업그레이드")
 
-4.2.4 사용량 표시 인디케이터 (UsageIndicator)
-Container
-├── padding: EdgeInsets.all(8)
-├── decoration: 테두리 + 연한 배경
-└── Column
-    ├── Text("무료 계정 사용량")
-    ├── SizedBox(height: 8)
-    ├── 진행률 바들: Column
-    │   ├── 리튼 사용량: LinearProgressIndicator
-    │   │   ├── value: currentNotes / maxNotes
-    │   │   ├── color: 80% 이상 시 주황색
-    │   │   └── label: "리튼: 2/3개"
-    │   ├── 파일 사용량들 (음성, 쓰기)
-    │   └── 저장 용량: LinearProgressIndicator
-    └── 업그레이드 버튼 (사용량 90% 이상일 때만)
-
-4.2.5 제한 도달 시 차단 UI (BlockedActionOverlay)
-Container
-├── color: Colors.black.withOpacity(0.7)
-├── child: Center
-│   └── Card
-│       └── Padding
-│           └── Column
-│               ├── Icon(Icons.lock, size: 48, color: Colors.orange)
-│               ├── SizedBox(height: 16)
-│               ├── Text("사용 제한 도달", style: 제목)
-│               ├── SizedBox(height: 8)
-│               ├── Text("무료 계정의 [기능명] 제한에 도달했습니다")
-│               ├── SizedBox(height: 16)
-│               └── Row
-│                   ├── TextButton("파일 삭제")
-│                   └── ElevatedButton("업그레이드")
-└── 배경 탭 시 차단 (pointer events 차단)
 
 4.3 파일 수 배지 컴포넌트
 Container
@@ -434,6 +364,17 @@ Container
 - 쓰기: Colors.green
 
 4.3 상태 표시 컴포넌트
+
+4.3.1 음성-쓰기 동기화 상태 표시 (AudioSyncIndicator)
+Container
+├── padding: EdgeInsets.all(8)
+├── decoration: 연한 배경색 + 테두리
+└── Row
+    ├── Icon(Icons.sync, color: Colors.blue)
+    ├── SizedBox(width: 8)
+    ├── Text("음성 동기화 활성", color: Colors.blue)
+    └── 조건부 표시: 현재 재생 시간 "02:34"
+
 // 듣기 중 상태
 Row
 ├── Icon(Icons.record_voice_over, color: Colors.red)
@@ -765,7 +706,7 @@ boxShadowMedium: BoxShadow(
 │                                     │
 │ ┌─ 계정 및 구독 ──────────────────┐ │
 │ │ 👤 무료 사용자                  │ │
-│ │ 📊 사용량: 2/3 리튼, 8/15 파일  │ │
+│ │    📊 통계: 2개 리튼, 8개 파일    │ │
 │ │ [🎁 프리미엄 업그레이드]        │ │
 │ │ [📜 변환 이력] [☁️ 동기화 상태]  │ │
 │ └─────────────────────────────────┘ │
@@ -839,15 +780,10 @@ class MainTabScreen extends StatefulWidget {
     'monochrome_grey'
   ];
   
-  // 사용량 제한 관리 변수들
+  // 사용량 통계 변수들
   int _currentNoteCount = 0;        // 현재 리튼 수
   int _currentRecordingCount = 0;   // 현재 음성 파일 수
   int _currentWritingCount = 0;     // 현재 텍스트 파일 수
-  int _maxNotes = 3;                // 최대 리튼 수 (무료)
-  int _maxFilesPerType = 5;         // 타입별 최대 파일 수 (무료)
-  bool _showUsageWarning = false;   // 사용량 경고 표시 여부
-  
-  bool _isWritingCountBlinking = false; // 깜빡임 효과
 }
 
 // 상태 업데이트 메서드들
@@ -859,35 +795,8 @@ void _loadAd() { setState(() {...}); }          // 광고 로딩
 void _onAdClicked() { }                         // 광고 클릭 처리
 void _showUpgradeDialog() { }                   // 프리미엄 업그레이드 안내
 
-// 사용량 제한 관리 메서드들
-bool _checkNoteLimit() {                        // 리튼 생성 제한 확인
-  if (!_isPremiumUser && _currentNoteCount >= _maxNotes) {
-    _showLimitWarningDialog('note');
-    return false;
-  }
-  return true;
-}
-
-bool _checkFileLimit(String fileType) {        // 파일 생성 제한 확인
-  if (_isPremiumUser) return true;
-  
-  int currentCount = _getCurrentFileCount(fileType);
-  if (currentCount >= _maxFilesPerType) {
-    _showLimitWarningDialog(fileType);
-    return false;
-  }
-  return true;
-}
-
-void _showLimitWarningDialog(String limitType) { // 제한 경고 다이얼로그 표시
-  showDialog(context: context, builder: (context) => LimitWarningDialog(limitType));
-}
-
-void _showFileDeleteDialog(String fileType) {   // 파일 삭제 선택 다이얼로그
-  showDialog(context: context, builder: (context) => FileDeleteDialog(fileType));
-}
-
-void _updateUsageCount() {                      // 사용량 카운트 업데이트
+// 통계 관리 메서드들
+void _updateUsageStats() {                      // 사용량 통계 업데이트
   setState(() {
     // 실제 파일 수 계산 로직
   });
@@ -3879,7 +3788,7 @@ class AccountSubscriptionCard extends StatelessWidget {
                   Icon(Icons.bar_chart, size: 16, color: Colors.grey.shade600),
                   SizedBox(width: 4),
                   Text(
-                    '사용량: $currentNotes/$maxNotes 리튼, $currentFiles/$maxFiles 파일',
+                    '통계: $currentNotes개 리튼, $currentFiles개 파일',
                     style: TextStyle(fontSize: 14, color: Colors.grey.shade600),
                   ),
                 ],
@@ -3894,12 +3803,12 @@ class AccountSubscriptionCard extends StatelessWidget {
                       Text('리튼: ', style: TextStyle(fontSize: 12)),
                       Expanded(
                         child: LinearProgressIndicator(
-                          value: currentNotes / maxNotes,
+                          value: currentNotes > 0 ? 1.0 : 0.0,
                           backgroundColor: Colors.grey.shade300,
                         ),
                       ),
                       SizedBox(width: 8),
-                      Text('$currentNotes/$maxNotes', style: TextStyle(fontSize: 12)),
+                      Text('$currentNotes개', style: TextStyle(fontSize: 12)),
                     ],
                   ),
                   SizedBox(height: 4),
@@ -3908,12 +3817,12 @@ class AccountSubscriptionCard extends StatelessWidget {
                       Text('파일: ', style: TextStyle(fontSize: 12)),
                       Expanded(
                         child: LinearProgressIndicator(
-                          value: currentFiles / maxFiles,
+                          value: currentFiles > 0 ? 1.0 : 0.0,
                           backgroundColor: Colors.grey.shade300,
                         ),
                       ),
                       SizedBox(width: 8),
-                      Text('$currentFiles/$maxFiles', style: TextStyle(fontSize: 12)),
+                      Text('$currentFiles개', style: TextStyle(fontSize: 12)),
                     ],
                   ),
                 ],
@@ -5152,7 +5061,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
     ),
     OnboardingPage(
       title: '음성으로 쉽게 기록하세요',
-      subtitle: '회의, 강의, 인터뷰를 녹음하고\n자동으로 텍스트로 변환됩니다',
+      subtitle: '회의, 강의, 인터뷰를 듣기하고\n자동으로 텍스트로 변환됩니다',
       imagePath: 'assets/onboarding/recording.png',
       backgroundColor: Color(0xFF06B6D4),
     ),
@@ -6256,7 +6165,7 @@ class _MainScreenState extends State<MainScreen> {
 
 ### UI 개선 사항 (10가지)
 1. ✅ **광고 표시 UI** - 무료 사용자용 AdBanner 컴포넌트
-2. ✅ **무료/유료 제한 관리 UI** - 사용량 제한 다이얼로그 및 알림
+2. ✅ **무료/유료 차별화 UI** - 프리미엄 업그레이드 다이얼로그
 3. ✅ **5가지 테마 시스템** - 완전한 테마 선택 및 관리 UI
 4. ✅ **리치 텍스트 에디터 도구바** - 마크다운 지원 도구바
 5. ✅ **음성 북마크 기능 UI** - 타임스탬프 북마크 시스템
@@ -6271,6 +6180,7 @@ class _MainScreenState extends State<MainScreen> {
 12. ✅ **국가별 테마 자동 선택** - 지역별 선호 테마 자동 설정 
 13. ✅ **상단 상태 표시** - TopStatusBar로 현재 상태 실시간 표시
 14. ✅ **UUID 생성 및 서버 등록** - 앱 고유 아이디 생성 시스템
+15. ✅ **음성-쓰기 동기화 기능** - 필기 시점과 음성 재생 시간 연결 저장
 
 ## 결론
 
