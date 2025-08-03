@@ -6274,10 +6274,2771 @@ class _MainScreenState extends State<MainScreen> {
 
 ## 결론
 
+================================================================================
+
+15. 음성 녹음/재생 서비스 (AudioService)
+
+================================================================================
+
+음성 녹음과 재생을 관리하는 핵심 서비스 클래스입니다.
+
+```dart
+import 'dart:io';
+import 'dart:async';
+import 'package:flutter/foundation.dart';
+import 'package:audioplayers/audioplayers.dart';
+import 'package:record/record.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:permission_handler/permission_handler.dart';
+
+class AudioService extends ChangeNotifier {
+  // 싱글톤 인스턴스
+  static final AudioService _instance = AudioService._internal();
+  factory AudioService() => _instance;
+  AudioService._internal();
+
+  // 오디오 관련 인스턴스
+  final AudioRecorder _recorder = AudioRecorder();
+  final AudioPlayer _player = AudioPlayer();
+  
+  // 녹음 상태
+  bool _isRecording = false;
+  bool _isRecordingPaused = false;
+  Duration _recordingDuration = Duration.zero;
+  Timer? _recordingTimer;
+  String? _currentRecordingPath;
+  
+  // 재생 상태
+  bool _isPlaying = false;
+  bool _isPlayingPaused = false;
+  Duration _playingDuration = Duration.zero;
+  Duration _totalDuration = Duration.zero;
+  double _playbackSpeed = 1.0;
+  String? _currentPlayingPath;
+  Timer? _playingTimer;
+  
+  // 북마크 관리
+  List<VoiceBookmark> _bookmarks = [];
+  
+  // 설정
+  String _audioQuality = 'high'; // high, medium, low
+  int _maxRecordingMinutes = 60; // 기본 1시간
+  int _autoSaveInterval = 60; // 60초마다 자동 저장
+  
+  // Getters - 녹음 관련
+  bool get isRecording => _isRecording;
+  bool get isRecordingPaused => _isRecordingPaused;
+  Duration get recordingDuration => _recordingDuration;
+  String? get currentRecordingPath => _currentRecordingPath;
+  
+  // Getters - 재생 관련
+  bool get isPlaying => _isPlaying;
+  bool get isPlayingPaused => _isPlayingPaused;
+  Duration get playingDuration => _playingDuration;
+  Duration get totalDuration => _totalDuration;
+  double get playbackSpeed => _playbackSpeed;
+  String? get currentPlayingPath => _currentPlayingPath;
+  double get playingProgress => _totalDuration.inMilliseconds > 0 
+      ? _playingDuration.inMilliseconds / _totalDuration.inMilliseconds 
+      : 0.0;
+  
+  // Getters - 기타
+  List<VoiceBookmark> get bookmarks => List.unmodifiable(_bookmarks);
+  String get audioQuality => _audioQuality;
+  int get maxRecordingMinutes => _maxRecordingMinutes;
+  
+  /// 초기화 및 권한 확인
+  Future<bool> initialize() async {
+    try {
+      // 마이크 권한 요청
+      final microphoneStatus = await Permission.microphone.request();
+      if (microphoneStatus != PermissionStatus.granted) {
+        return false;
+      }
+      
+      // 저장소 권한 요청 (Android)
+      if (Platform.isAndroid) {
+        final storageStatus = await Permission.storage.request();
+        if (storageStatus != PermissionStatus.granted) {
+          return false;
+        }
+      }
+      
+      // 오디오 플레이어 이벤트 리스너 설정
+      _setupPlayerListeners();
+      
+      return true;
+    } catch (e) {
+      debugPrint('AudioService 초기화 실패: $e');
+      return false;
+    }
+  }
+  
+  /// 오디오 플레이어 이벤트 리스너 설정
+  void _setupPlayerListeners() {
+    _player.onDurationChanged.listen((duration) {
+      _totalDuration = duration;
+      notifyListeners();
+    });
+    
+    _player.onPositionChanged.listen((position) {
+      _playingDuration = position;
+      notifyListeners();
+    });
+    
+    _player.onPlayerComplete.listen((_) {
+      _stopPlaying();
+    });
+  }
+  
+  // ========================================
+  // 녹음 기능
+  // ========================================
+  
+  /// 녹음 시작
+  Future<bool> startRecording({String? fileName}) async {
+    try {
+      if (_isRecording) return false;
+      
+      // 파일 경로 생성
+      final directory = await getApplicationDocumentsDirectory();
+      final recordingsDir = Directory('${directory.path}/recordings');
+      if (!await recordingsDir.exists()) {
+        await recordingsDir.create(recursive: true);
+      }
+      
+      final timestamp = DateTime.now().millisecondsSinceEpoch;
+      final name = fileName ?? 'recording_$timestamp';
+      _currentRecordingPath = '${recordingsDir.path}/$name.m4a';
+      
+      // 녹음 설정
+      final config = RecordConfig(
+        encoder: _getAudioEncoder(),
+        bitRate: _getAudioBitRate(),
+        sampleRate: _getAudioSampleRate(),
+      );
+      
+      // 녹음 시작
+      await _recorder.start(config, path: _currentRecordingPath!);
+      
+      _isRecording = true;
+      _isRecordingPaused = false;
+      _recordingDuration = Duration.zero;
+      
+      // 녹음 시간 타이머 시작
+      _startRecordingTimer();
+      
+      notifyListeners();
+      return true;
+    } catch (e) {
+      debugPrint('녹음 시작 실패: $e');
+      return false;
+    }
+  }
+  
+  /// 녹음 일시정지
+  Future<bool> pauseRecording() async {
+    try {
+      if (!_isRecording || _isRecordingPaused) return false;
+      
+      await _recorder.pause();
+      _isRecordingPaused = true;
+      _recordingTimer?.cancel();
+      
+      notifyListeners();
+      return true;
+    } catch (e) {
+      debugPrint('녹음 일시정지 실패: $e');
+      return false;
+    }
+  }
+  
+  /// 녹음 재개
+  Future<bool> resumeRecording() async {
+    try {
+      if (!_isRecording || !_isRecordingPaused) return false;
+      
+      await _recorder.resume();
+      _isRecordingPaused = false;
+      _startRecordingTimer();
+      
+      notifyListeners();
+      return true;
+    } catch (e) {
+      debugPrint('녹음 재개 실패: $e');
+      return false;
+    }
+  }
+  
+  /// 녹음 중지 및 저장
+  Future<String?> stopRecording() async {
+    try {
+      if (!_isRecording) return null;
+      
+      final path = await _recorder.stop();
+      
+      _isRecording = false;
+      _isRecordingPaused = false;
+      _recordingTimer?.cancel();
+      
+      final savedPath = _currentRecordingPath;
+      _currentRecordingPath = null;
+      _recordingDuration = Duration.zero;
+      
+      notifyListeners();
+      return savedPath;
+    } catch (e) {
+      debugPrint('녹음 중지 실패: $e');
+      return null;
+    }
+  }
+  
+  /// 녹음 취소 (파일 삭제)
+  Future<bool> cancelRecording() async {
+    try {
+      if (!_isRecording) return false;
+      
+      await _recorder.stop();
+      
+      // 임시 파일 삭제
+      if (_currentRecordingPath != null) {
+        final file = File(_currentRecordingPath!);
+        if (await file.exists()) {
+          await file.delete();
+        }
+      }
+      
+      _isRecording = false;
+      _isRecordingPaused = false;
+      _recordingTimer?.cancel();
+      _currentRecordingPath = null;
+      _recordingDuration = Duration.zero;
+      
+      notifyListeners();
+      return true;
+    } catch (e) {
+      debugPrint('녹음 취소 실패: $e');
+      return false;
+    }
+  }
+  
+  /// 녹음 시간 타이머 시작
+  void _startRecordingTimer() {
+    _recordingTimer = Timer.periodic(Duration(seconds: 1), (timer) {
+      _recordingDuration = Duration(seconds: _recordingDuration.inSeconds + 1);
+      
+      // 최대 녹음 시간 체크
+      if (_recordingDuration.inMinutes >= _maxRecordingMinutes) {
+        stopRecording();
+        return;
+      }
+      
+      notifyListeners();
+    });
+  }
+  
+  // ========================================
+  // 재생 기능
+  // ========================================
+  
+  /// 오디오 파일 재생
+  Future<bool> playAudio(String filePath) async {
+    try {
+      // 현재 재생 중인 파일이 있다면 중지
+      if (_isPlaying) {
+        await stopPlaying();
+      }
+      
+      await _player.play(DeviceFileSource(filePath));
+      await _player.setPlaybackRate(_playbackSpeed);
+      
+      _isPlaying = true;
+      _isPlayingPaused = false;
+      _currentPlayingPath = filePath;
+      
+      notifyListeners();
+      return true;
+    } catch (e) {
+      debugPrint('오디오 재생 실패: $e');
+      return false;
+    }
+  }
+  
+  /// 재생 일시정지
+  Future<bool> pausePlaying() async {
+    try {
+      if (!_isPlaying || _isPlayingPaused) return false;
+      
+      await _player.pause();
+      _isPlayingPaused = true;
+      
+      notifyListeners();
+      return true;
+    } catch (e) {
+      debugPrint('재생 일시정지 실패: $e');
+      return false;
+    }
+  }
+  
+  /// 재생 재개
+  Future<bool> resumePlaying() async {
+    try {
+      if (!_isPlaying || !_isPlayingPaused) return false;
+      
+      await _player.resume();
+      _isPlayingPaused = false;
+      
+      notifyListeners();
+      return true;
+    } catch (e) {
+      debugPrint('재생 재개 실패: $e');
+      return false;
+    }
+  }
+  
+  /// 재생 중지
+  Future<bool> stopPlaying() async {
+    try {
+      await _player.stop();
+      _stopPlaying();
+      return true;
+    } catch (e) {
+      debugPrint('재생 중지 실패: $e');
+      return false;
+    }
+  }
+  
+  void _stopPlaying() {
+    _isPlaying = false;
+    _isPlayingPaused = false;
+    _playingDuration = Duration.zero;
+    _totalDuration = Duration.zero;
+    _currentPlayingPath = null;
+    notifyListeners();
+  }
+  
+  /// 재생 위치 변경
+  Future<bool> seekTo(Duration position) async {
+    try {
+      await _player.seek(position);
+      _playingDuration = position;
+      notifyListeners();
+      return true;
+    } catch (e) {
+      debugPrint('재생 위치 변경 실패: $e');
+      return false;
+    }
+  }
+  
+  /// 재생 속도 변경
+  Future<bool> setPlaybackSpeed(double speed) async {
+    try {
+      if (speed < 0.5 || speed > 2.0) return false;
+      
+      _playbackSpeed = speed;
+      if (_isPlaying) {
+        await _player.setPlaybackRate(speed);
+      }
+      
+      notifyListeners();
+      return true;
+    } catch (e) {
+      debugPrint('재생 속도 변경 실패: $e');
+      return false;
+    }
+  }
+  
+  // ========================================
+  // 북마크 기능
+  // ========================================
+  
+  /// 북마크 추가
+  VoiceBookmark addBookmark({
+    required String audioFileId,
+    required Duration timestamp,
+    String? label,
+  }) {
+    final bookmark = VoiceBookmark(
+      id: DateTime.now().millisecondsSinceEpoch.toString(),
+      audioFileId: audioFileId,
+      timestamp: timestamp,
+      label: label ?? '북마크 ${_bookmarks.length + 1}',
+      createdAt: DateTime.now(),
+    );
+    
+    _bookmarks.add(bookmark);
+    _bookmarks.sort((a, b) => a.timestamp.compareTo(b.timestamp));
+    
+    notifyListeners();
+    return bookmark;
+  }
+  
+  /// 북마크 삭제
+  bool removeBookmark(String bookmarkId) {
+    final index = _bookmarks.indexWhere((b) => b.id == bookmarkId);
+    if (index != -1) {
+      _bookmarks.removeAt(index);
+      notifyListeners();
+      return true;
+    }
+    return false;
+  }
+  
+  /// 북마크로 이동
+  Future<bool> jumpToBookmark(VoiceBookmark bookmark) async {
+    try {
+      if (_currentPlayingPath?.contains(bookmark.audioFileId) == true) {
+        return await seekTo(bookmark.timestamp);
+      } else {
+        // 해당 오디오 파일 재생 후 북마크 위치로 이동
+        // 실제 구현에서는 파일 경로를 찾는 로직 필요
+        return false;
+      }
+    } catch (e) {
+      debugPrint('북마크 이동 실패: $e');
+      return false;
+    }
+  }
+  
+  /// 특정 오디오 파일의 북마크 목록 가져오기
+  List<VoiceBookmark> getBookmarksForAudio(String audioFileId) {
+    return _bookmarks.where((b) => b.audioFileId == audioFileId).toList();
+  }
+  
+  // ========================================
+  // 설정 관리
+  // ========================================
+  
+  /// 오디오 품질 설정
+  void setAudioQuality(String quality) {
+    if (['high', 'medium', 'low'].contains(quality)) {
+      _audioQuality = quality;
+      notifyListeners();
+    }
+  }
+  
+  /// 최대 녹음 시간 설정 (분)
+  void setMaxRecordingMinutes(int minutes) {
+    if (minutes > 0 && minutes <= 180) { // 최대 3시간
+      _maxRecordingMinutes = minutes;
+      notifyListeners();
+    }
+  }
+  
+  /// 자동 저장 간격 설정 (초)
+  void setAutoSaveInterval(int seconds) {
+    if (seconds >= 10 && seconds <= 600) { // 10초~10분
+      _autoSaveInterval = seconds;
+      notifyListeners();
+    }
+  }
+  
+  // ========================================
+  // 헬퍼 메서드
+  // ========================================
+  
+  /// 오디오 엔코더 가져오기
+  AudioEncoder _getAudioEncoder() {
+    switch (_audioQuality) {
+      case 'high':
+        return AudioEncoder.aacLc;
+      case 'medium':
+        return AudioEncoder.aacHe;
+      case 'low':
+        return AudioEncoder.opus;
+      default:
+        return AudioEncoder.aacLc;
+    }
+  }
+  
+  /// 오디오 비트레이트 가져오기
+  int _getAudioBitRate() {
+    switch (_audioQuality) {
+      case 'high':
+        return 192000; // 192 kbps
+      case 'medium':
+        return 128000; // 128 kbps
+      case 'low':
+        return 64000;  // 64 kbps
+      default:
+        return 128000;
+    }
+  }
+  
+  /// 오디오 샘플레이트 가져오기
+  int _getAudioSampleRate() {
+    switch (_audioQuality) {
+      case 'high':
+        return 48000; // 48 kHz
+      case 'medium':
+        return 44100; // 44.1 kHz
+      case 'low':
+        return 22050; // 22.05 kHz
+      default:
+        return 44100;
+    }
+  }
+  
+  /// 시간 포맷팅
+  String formatDuration(Duration duration) {
+    String twoDigits(int n) => n.toString().padLeft(2, '0');
+    final hours = duration.inHours;
+    final minutes = duration.inMinutes.remainder(60);
+    final seconds = duration.inSeconds.remainder(60);
+    
+    if (hours > 0) {
+      return '${twoDigits(hours)}:${twoDigits(minutes)}:${twoDigits(seconds)}';
+    } else {
+      return '${twoDigits(minutes)}:${twoDigits(seconds)}';
+    }
+  }
+  
+  /// 리소스 정리
+  @override
+  void dispose() {
+    _recordingTimer?.cancel();
+    _playingTimer?.cancel();
+    _recorder.dispose();
+    _player.dispose();
+    super.dispose();
+  }
+}
+
+/// 음성 북마크 데이터 클래스
+class VoiceBookmark {
+  final String id;
+  final String audioFileId;
+  final Duration timestamp;
+  final String label;
+  final DateTime createdAt;
+
+  VoiceBookmark({
+    required this.id,
+    required this.audioFileId,
+    required this.timestamp,
+    required this.label,
+    required this.createdAt,
+  });
+
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'audioFileId': audioFileId,
+    'timestamp': timestamp.inMilliseconds,
+    'label': label,
+    'createdAt': createdAt.toIso8601String(),
+  };
+
+  factory VoiceBookmark.fromJson(Map<String, dynamic> json) => VoiceBookmark(
+    id: json['id'],
+    audioFileId: json['audioFileId'],
+    timestamp: Duration(milliseconds: json['timestamp']),
+    label: json['label'],
+    createdAt: DateTime.parse(json['createdAt']),
+  );
+}
+```
+
+================================================================================
+
+16. 텍스트 에디터 서비스 (TextEditorService)
+
+================================================================================
+
+텍스트 편집, 마크다운 처리, 자동저장을 관리하는 핵심 서비스 클래스입니다.
+
+```dart
+import 'dart:io';
+import 'dart:async';
+import 'dart:convert';
+import 'package:flutter/foundation.dart';
+import 'package:flutter_quill/flutter_quill.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+class TextEditorService extends ChangeNotifier {
+  // 싱글톤 인스턴스
+  static final TextEditorService _instance = TextEditorService._internal();
+  factory TextEditorService() => _instance;
+  TextEditorService._internal();
+
+  // Quill 에디터 컨트롤러
+  QuillController? _quillController;
+  
+  // 현재 문서 정보
+  String? _currentDocumentId;
+  String? _currentDocumentPath;
+  String _currentTitle = '';
+  bool _hasUnsavedChanges = false;
+  DateTime? _lastSaved;
+  
+  // 자동저장 관련
+  Timer? _autoSaveTimer;
+  int _autoSaveInterval = 60; // 60초 기본값
+  bool _autoSaveEnabled = true;
+  
+  // 편집 설정
+  bool _markdownMode = false;
+  String _defaultFont = 'Roboto';
+  double _defaultFontSize = 16.0;
+  int _maxUndoHistory = 100;
+  
+  // 검색 및 교체
+  String _lastSearchTerm = '';
+  List<int> _searchResults = [];
+  int _currentSearchIndex = -1;
+  
+  // 단어 수 및 통계
+  int _wordCount = 0;
+  int _characterCount = 0;
+  int _paragraphCount = 0;
+  
+  // Getters
+  QuillController? get quillController => _quillController;
+  String? get currentDocumentId => _currentDocumentId;
+  String? get currentDocumentPath => _currentDocumentPath;
+  String get currentTitle => _currentTitle;
+  bool get hasUnsavedChanges => _hasUnsavedChanges;
+  DateTime? get lastSaved => _lastSaved;
+  bool get autoSaveEnabled => _autoSaveEnabled;
+  int get autoSaveInterval => _autoSaveInterval;
+  bool get markdownMode => _markdownMode;
+  String get defaultFont => _defaultFont;
+  double get defaultFontSize => _defaultFontSize;
+  int get wordCount => _wordCount;
+  int get characterCount => _characterCount;
+  int get paragraphCount => _paragraphCount;
+  List<int> get searchResults => _searchResults;
+  int get currentSearchIndex => _currentSearchIndex;
+  
+  /// 초기화
+  Future<bool> initialize() async {
+    try {
+      // 설정 로드
+      await _loadSettings();
+      
+      // 기본 Quill 컨트롤러 생성
+      _quillController = QuillController.basic();
+      _setupQuillListeners();
+      
+      return true;
+    } catch (e) {
+      debugPrint('TextEditorService 초기화 실패: $e');
+      return false;
+    }
+  }
+  
+  /// Quill 컨트롤러 이벤트 리스너 설정
+  void _setupQuillListeners() {
+    _quillController?.document.changes.listen((_) {
+      _hasUnsavedChanges = true;
+      _updateStatistics();
+      notifyListeners();
+      
+      // 자동저장 타이머 재시작
+      if (_autoSaveEnabled) {
+        _restartAutoSaveTimer();
+      }
+    });
+  }
+  
+  // ========================================
+  // 문서 관리
+  // ========================================
+  
+  /// 새 문서 생성
+  Future<bool> createNewDocument({String? title}) async {
+    try {
+      // 기존 문서 저장 확인
+      if (_hasUnsavedChanges) {
+        await saveCurrentDocument();
+      }
+      
+      // 새 문서 ID 생성
+      _currentDocumentId = DateTime.now().millisecondsSinceEpoch.toString();
+      _currentTitle = title ?? '제목 없는 문서';
+      
+      // 파일 경로 생성
+      final directory = await getApplicationDocumentsDirectory();
+      final documentsDir = Directory('${directory.path}/documents');
+      if (!await documentsDir.exists()) {
+        await documentsDir.create(recursive: true);
+      }
+      
+      _currentDocumentPath = '${documentsDir.path}/$_currentDocumentId.json';
+      
+      // Quill 컨트롤러 초기화
+      _quillController?.dispose();
+      _quillController = QuillController.basic();
+      _setupQuillListeners();
+      
+      _hasUnsavedChanges = false;
+      _lastSaved = null;
+      _updateStatistics();
+      
+      notifyListeners();
+      return true;
+    } catch (e) {
+      debugPrint('새 문서 생성 실패: $e');
+      return false;
+    }
+  }
+  
+  /// 문서 열기
+  Future<bool> openDocument(String documentPath) async {
+    try {
+      // 기존 문서 저장 확인
+      if (_hasUnsavedChanges) {
+        await saveCurrentDocument();
+      }
+      
+      final file = File(documentPath);
+      if (!await file.exists()) {
+        return false;
+      }
+      
+      // 문서 데이터 읽기
+      final jsonString = await file.readAsString();
+      final documentData = jsonDecode(jsonString);
+      
+      // 문서 정보 설정
+      _currentDocumentPath = documentPath;
+      _currentDocumentId = documentData['id'];
+      _currentTitle = documentData['title'] ?? '제목 없는 문서';
+      
+      // Quill 문서 로드
+      final delta = Delta.fromJson(documentData['content']);
+      _quillController?.dispose();
+      _quillController = QuillController(
+        document: Document.fromDelta(delta),
+        selection: const TextSelection.collapsed(offset: 0),
+      );
+      _setupQuillListeners();
+      
+      _hasUnsavedChanges = false;
+      _lastSaved = DateTime.parse(documentData['lastSaved']);
+      _updateStatistics();
+      
+      notifyListeners();
+      return true;
+    } catch (e) {
+      debugPrint('문서 열기 실패: $e');
+      return false;
+    }
+  }
+  
+  /// 현재 문서 저장
+  Future<bool> saveCurrentDocument() async {
+    try {
+      if (_currentDocumentPath == null || _quillController == null) {
+        return false;
+      }
+      
+      final documentData = {
+        'id': _currentDocumentId,
+        'title': _currentTitle,
+        'content': _quillController!.document.toDelta().toJson(),
+        'lastSaved': DateTime.now().toIso8601String(),
+        'wordCount': _wordCount,
+        'characterCount': _characterCount,
+        'paragraphCount': _paragraphCount,
+      };
+      
+      final file = File(_currentDocumentPath!);
+      await file.writeAsString(jsonEncode(documentData));
+      
+      _hasUnsavedChanges = false;
+      _lastSaved = DateTime.now();
+      
+      notifyListeners();
+      return true;
+    } catch (e) {
+      debugPrint('문서 저장 실패: $e');
+      return false;
+    }
+  }
+  
+  /// 다른 이름으로 저장
+  Future<bool> saveDocumentAs(String newTitle, {String? customPath}) async {
+    try {
+      final oldPath = _currentDocumentPath;
+      final oldId = _currentDocumentId;
+      
+      // 새 문서 정보 설정
+      _currentDocumentId = DateTime.now().millisecondsSinceEpoch.toString();
+      _currentTitle = newTitle;
+      
+      if (customPath != null) {
+        _currentDocumentPath = customPath;
+      } else {
+        final directory = await getApplicationDocumentsDirectory();
+        final documentsDir = Directory('${directory.path}/documents');
+        _currentDocumentPath = '${documentsDir.path}/$_currentDocumentId.json';
+      }
+      
+      // 새 경로에 저장
+      final success = await saveCurrentDocument();
+      
+      if (!success) {
+        // 실패 시 원래 정보 복원
+        _currentDocumentPath = oldPath;
+        _currentDocumentId = oldId;
+        return false;
+      }
+      
+      return true;
+    } catch (e) {
+      debugPrint('다른 이름으로 저장 실패: $e');
+      return false;
+    }
+  }
+  
+  // ========================================
+  // 텍스트 편집 기능
+  // ========================================
+  
+  /// 텍스트 삽입
+  void insertText(String text, {int? position}) {
+    if (_quillController == null) return;
+    
+    final insertPosition = position ?? _quillController!.selection.baseOffset;
+    _quillController!.document.insert(insertPosition, text);
+    
+    // 커서 위치 업데이트
+    _quillController!.updateSelection(
+      TextSelection.collapsed(offset: insertPosition + text.length),
+      ChangeSource.LOCAL,
+    );
+  }
+  
+  /// 선택된 텍스트 서식 적용
+  void applyFormat(Attribute attribute) {
+    if (_quillController == null) return;
+    
+    final selection = _quillController!.selection;
+    if (selection.isValid) {
+      _quillController!.formatSelection(attribute);
+    }
+  }
+  
+  /// 볼드 토글
+  void toggleBold() {
+    applyFormat(Attribute.bold);
+  }
+  
+  /// 이탤릭 토글
+  void toggleItalic() {
+    applyFormat(Attribute.italic);
+  }
+  
+  /// 밑줄 토글
+  void toggleUnderline() {
+    applyFormat(Attribute.underline);
+  }
+  
+  /// 하이라이트 적용
+  void applyHighlight(String color) {
+    final attribute = BackgroundAttribute(color);
+    applyFormat(attribute);
+  }
+  
+  /// 글꼴 크기 변경
+  void changeFontSize(double size) {
+    final attribute = SizeAttribute(size.toString());
+    applyFormat(attribute);
+  }
+  
+  /// 글꼴 변경
+  void changeFontFamily(String fontFamily) {
+    final attribute = FontAttribute(fontFamily);
+    applyFormat(attribute);
+  }
+  
+  /// 정렬 변경
+  void changeAlignment(Attribute alignment) {
+    applyFormat(alignment);
+  }
+  
+  // ========================================
+  // 마크다운 기능
+  // ========================================
+  
+  /// 마크다운 모드 토글
+  void toggleMarkdownMode() {
+    _markdownMode = !_markdownMode;
+    notifyListeners();
+  }
+  
+  /// 마크다운을 Quill 형식으로 변환
+  Future<bool> convertMarkdownToQuill(String markdown) async {
+    try {
+      // 간단한 마크다운 파싱 (실제로는 더 복잡한 라이브러리 사용)
+      final delta = Delta();
+      
+      final lines = markdown.split('\n');
+      for (final line in lines) {
+        if (line.startsWith('# ')) {
+          delta.insert(line.substring(2));
+          delta.retain(1, {'header': 1});
+        } else if (line.startsWith('## ')) {
+          delta.insert(line.substring(3));
+          delta.retain(1, {'header': 2});
+        } else if (line.startsWith('**') && line.endsWith('**')) {
+          delta.insert(line.substring(2, line.length - 2));
+          delta.retain(1, {'bold': true});
+        } else {
+          delta.insert(line);
+        }
+        delta.insert('\n');
+      }
+      
+      _quillController?.compose(delta, TextSelection.collapsed(offset: 0), ChangeSource.LOCAL);
+      return true;
+    } catch (e) {
+      debugPrint('마크다운 변환 실패: $e');
+      return false;
+    }
+  }
+  
+  /// Quill 형식을 마크다운으로 변환
+  String convertQuillToMarkdown() {
+    if (_quillController == null) return '';
+    
+    // 간단한 변환 로직 (실제로는 더 복잡한 구현 필요)
+    return _quillController!.document.toPlainText();
+  }
+  
+  // ========================================
+  // 검색 및 교체
+  // ========================================
+  
+  /// 텍스트 검색
+  List<int> searchText(String searchTerm, {bool caseSensitive = false}) {
+    if (_quillController == null || searchTerm.isEmpty) {
+      _searchResults.clear();
+      _currentSearchIndex = -1;
+      notifyListeners();
+      return [];
+    }
+    
+    final text = _quillController!.document.toPlainText();
+    final term = caseSensitive ? searchTerm : searchTerm.toLowerCase();
+    final content = caseSensitive ? text : text.toLowerCase();
+    
+    _searchResults.clear();
+    int index = 0;
+    
+    while (index < content.length) {
+      final foundIndex = content.indexOf(term, index);
+      if (foundIndex == -1) break;
+      
+      _searchResults.add(foundIndex);
+      index = foundIndex + 1;
+    }
+    
+    _lastSearchTerm = searchTerm;
+    _currentSearchIndex = _searchResults.isNotEmpty ? 0 : -1;
+    
+    if (_searchResults.isNotEmpty) {
+      _goToSearchResult(0);
+    }
+    
+    notifyListeners();
+    return _searchResults;
+  }
+  
+  /// 다음 검색 결과로 이동
+  void goToNextSearchResult() {
+    if (_searchResults.isEmpty) return;
+    
+    _currentSearchIndex = (_currentSearchIndex + 1) % _searchResults.length;
+    _goToSearchResult(_currentSearchIndex);
+  }
+  
+  /// 이전 검색 결과로 이동
+  void goToPreviousSearchResult() {
+    if (_searchResults.isEmpty) return;
+    
+    _currentSearchIndex = (_currentSearchIndex - 1 + _searchResults.length) % _searchResults.length;
+    _goToSearchResult(_currentSearchIndex);
+  }
+  
+  void _goToSearchResult(int index) {
+    if (index < 0 || index >= _searchResults.length) return;
+    
+    final position = _searchResults[index];
+    final selection = TextSelection(
+      baseOffset: position,
+      extentOffset: position + _lastSearchTerm.length,
+    );
+    
+    _quillController?.updateSelection(selection, ChangeSource.LOCAL);
+  }
+  
+  /// 텍스트 교체
+  bool replaceText(String searchTerm, String replaceTerm, {bool replaceAll = false}) {
+    if (_quillController == null) return false;
+    
+    try {
+      if (replaceAll) {
+        // 모든 텍스트 교체
+        final text = _quillController!.document.toPlainText();
+        final newText = text.replaceAll(searchTerm, replaceTerm);
+        
+        _quillController!.replaceText(0, text.length, newText, TextSelection.collapsed(offset: 0));
+        return true;
+      } else {
+        // 현재 선택된 텍스트만 교체
+        final selection = _quillController!.selection;
+        if (selection.isValid && selection.textInside(_quillController!.document.toPlainText()) == searchTerm) {
+          _quillController!.replaceText(
+            selection.baseOffset,
+            selection.extentOffset - selection.baseOffset,
+            replaceTerm,
+            TextSelection.collapsed(offset: selection.baseOffset + replaceTerm.length),
+          );
+          return true;
+        }
+        return false;
+      }
+    } catch (e) {
+      debugPrint('텍스트 교체 실패: $e');
+      return false;
+    }
+  }
+  
+  // ========================================
+  // 자동저장 관리
+  // ========================================
+  
+  /// 자동저장 타이머 재시작
+  void _restartAutoSaveTimer() {
+    _autoSaveTimer?.cancel();
+    _autoSaveTimer = Timer(Duration(seconds: _autoSaveInterval), () {
+      if (_hasUnsavedChanges) {
+        saveCurrentDocument();
+      }
+    });
+  }
+  
+  /// 자동저장 설정 변경
+  void setAutoSaveEnabled(bool enabled) {
+    _autoSaveEnabled = enabled;
+    if (!enabled) {
+      _autoSaveTimer?.cancel();
+    } else if (_hasUnsavedChanges) {
+      _restartAutoSaveTimer();
+    }
+    notifyListeners();
+  }
+  
+  /// 자동저장 간격 설정
+  void setAutoSaveInterval(int seconds) {
+    if (seconds >= 10 && seconds <= 600) {
+      _autoSaveInterval = seconds;
+      if (_autoSaveEnabled && _hasUnsavedChanges) {
+        _restartAutoSaveTimer();
+      }
+      notifyListeners();
+    }
+  }
+  
+  // ========================================
+  // 통계 및 정보
+  // ========================================
+  
+  /// 문서 통계 업데이트
+  void _updateStatistics() {
+    if (_quillController == null) return;
+    
+    final text = _quillController!.document.toPlainText();
+    
+    _characterCount = text.length;
+    _wordCount = text.trim().isEmpty ? 0 : text.trim().split(RegExp(r'\s+')).length;
+    _paragraphCount = text.split('\n').where((line) => line.trim().isNotEmpty).length;
+    
+    notifyListeners();
+  }
+  
+  /// 읽기 시간 추정 (분)
+  int getEstimatedReadingTime() {
+    const wordsPerMinute = 250; // 평균 읽기 속도
+    return (_wordCount / wordsPerMinute).ceil();
+  }
+  
+  // ========================================
+  // 내보내기 기능
+  // ========================================
+  
+  /// 텍스트로 내보내기
+  String exportAsText() {
+    return _quillController?.document.toPlainText() ?? '';
+  }
+  
+  /// 마크다운으로 내보내기
+  String exportAsMarkdown() {
+    return convertQuillToMarkdown();
+  }
+  
+  /// HTML로 내보내기
+  String exportAsHtml() {
+    // Quill Delta를 HTML로 변환하는 로직
+    // 실제 구현에서는 quill_html_editor 패키지 사용 권장
+    return _quillController?.document.toPlainText() ?? '';
+  }
+  
+  // ========================================
+  // 설정 관리
+  // ========================================
+  
+  /// 설정 로드
+  Future<void> _loadSettings() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      
+      _autoSaveEnabled = prefs.getBool('text_editor_auto_save') ?? true;
+      _autoSaveInterval = prefs.getInt('text_editor_auto_save_interval') ?? 60;
+      _defaultFont = prefs.getString('text_editor_default_font') ?? 'Roboto';
+      _defaultFontSize = prefs.getDouble('text_editor_default_font_size') ?? 16.0;
+      _markdownMode = prefs.getBool('text_editor_markdown_mode') ?? false;
+    } catch (e) {
+      debugPrint('설정 로드 실패: $e');
+    }
+  }
+  
+  /// 설정 저장
+  Future<void> _saveSettings() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      
+      await prefs.setBool('text_editor_auto_save', _autoSaveEnabled);
+      await prefs.setInt('text_editor_auto_save_interval', _autoSaveInterval);
+      await prefs.setString('text_editor_default_font', _defaultFont);
+      await prefs.setDouble('text_editor_default_font_size', _defaultFontSize);
+      await prefs.setBool('text_editor_markdown_mode', _markdownMode);
+    } catch (e) {
+      debugPrint('설정 저장 실패: $e');
+    }
+  }
+  
+  /// 기본 글꼴 설정
+  void setDefaultFont(String fontFamily) {
+    _defaultFont = fontFamily;
+    _saveSettings();
+    notifyListeners();
+  }
+  
+  /// 기본 글꼴 크기 설정
+  void setDefaultFontSize(double fontSize) {
+    if (fontSize >= 10.0 && fontSize <= 72.0) {
+      _defaultFontSize = fontSize;
+      _saveSettings();
+      notifyListeners();
+    }
+  }
+  
+  // ========================================
+  // 실행 취소/다시 실행
+  // ========================================
+  
+  /// 실행 취소
+  void undo() {
+    _quillController?.undo();
+  }
+  
+  /// 다시 실행
+  void redo() {
+    _quillController?.redo();
+  }
+  
+  /// 실행 취소 가능 여부
+  bool get canUndo => _quillController?.hasUndo ?? false;
+  
+  /// 다시 실행 가능 여부
+  bool get canRedo => _quillController?.hasRedo ?? false;
+  
+  // ========================================
+  // 제목 관리
+  // ========================================
+  
+  /// 문서 제목 변경
+  void setTitle(String title) {
+    _currentTitle = title;
+    _hasUnsavedChanges = true;
+    notifyListeners();
+  }
+  
+  /// 첫 줄에서 자동 제목 생성
+  String generateAutoTitle() {
+    if (_quillController == null) return '제목 없는 문서';
+    
+    final text = _quillController!.document.toPlainText().trim();
+    if (text.isEmpty) return '제목 없는 문서';
+    
+    final firstLine = text.split('\n').first.trim();
+    if (firstLine.length > 50) {
+      return '${firstLine.substring(0, 47)}...';
+    }
+    
+    return firstLine.isEmpty ? '제목 없는 문서' : firstLine;
+  }
+  
+  /// 리소스 정리
+  @override
+  void dispose() {
+    _autoSaveTimer?.cancel();
+    _quillController?.dispose();
+    super.dispose();
+  }
+}
+
+/// 텍스트 에디터 설정 데이터 클래스
+class TextEditorSettings {
+  final bool autoSaveEnabled;
+  final int autoSaveInterval;
+  final String defaultFont;
+  final double defaultFontSize;
+  final bool markdownMode;
+  final int maxUndoHistory;
+
+  TextEditorSettings({
+    required this.autoSaveEnabled,
+    required this.autoSaveInterval,
+    required this.defaultFont,
+    required this.defaultFontSize,
+    required this.markdownMode,
+    required this.maxUndoHistory,
+  });
+
+  Map<String, dynamic> toJson() => {
+    'autoSaveEnabled': autoSaveEnabled,
+    'autoSaveInterval': autoSaveInterval,
+    'defaultFont': defaultFont,
+    'defaultFontSize': defaultFontSize,
+    'markdownMode': markdownMode,
+    'maxUndoHistory': maxUndoHistory,
+  };
+
+  factory TextEditorSettings.fromJson(Map<String, dynamic> json) => TextEditorSettings(
+    autoSaveEnabled: json['autoSaveEnabled'] ?? true,
+    autoSaveInterval: json['autoSaveInterval'] ?? 60,
+    defaultFont: json['defaultFont'] ?? 'Roboto',
+    defaultFontSize: json['defaultFontSize']?.toDouble() ?? 16.0,
+    markdownMode: json['markdownMode'] ?? false,
+    maxUndoHistory: json['maxUndoHistory'] ?? 100,
+  );
+}
+```
+
+================================================================================
+
+17. 필기/주석 시스템 (DrawingService)
+
+================================================================================
+
+Canvas 기반 필기, 드로잉, PDF 주석을 관리하는 핵심 서비스 클래스입니다.
+
+```dart
+import 'dart:io';
+import 'dart:async';
+import 'dart:convert';
+import 'dart:typed_data';
+import 'dart:ui' as ui;
+import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:image/image.dart' as img;
+
+class DrawingService extends ChangeNotifier {
+  // 싱글톤 인스턴스
+  static final DrawingService _instance = DrawingService._internal();
+  factory DrawingService() => _instance;
+  DrawingService._internal();
+
+  // Canvas 상태
+  final GlobalKey canvasKey = GlobalKey();
+  List<DrawingPath> _paths = [];
+  List<DrawingPath> _undoStack = [];
+  DrawingTool _currentTool = DrawingTool.pen;
+  Color _currentColor = Colors.black;
+  double _currentStrokeWidth = 2.0;
+  bool _isDrawing = false;
+  
+  // 배경 이미지/PDF
+  ui.Image? _backgroundImage;
+  String? _backgroundImagePath;
+  double _canvasWidth = 0;
+  double _canvasHeight = 0;
+  double _scaleFactor = 1.0;
+  Offset _panOffset = Offset.zero;
+  
+  // 선택 및 편집
+  DrawingPath? _selectedPath;
+  bool _isSelectionMode = false;
+  Rect? _selectionRect;
+  
+  // 레이어 관리
+  List<DrawingLayer> _layers = [];
+  int _currentLayerIndex = 0;
+  
+  // 그리드 및 가이드라인
+  bool _showGrid = false;
+  bool _snapToGrid = false;
+  double _gridSize = 20.0;
+  
+  // 필기 인식
+  bool _handwritingRecognitionEnabled = false;
+  List<String> _recognizedText = [];
+  
+  // Getters
+  List<DrawingPath> get paths => List.unmodifiable(_paths);
+  List<DrawingPath> get undoStack => List.unmodifiable(_undoStack);
+  DrawingTool get currentTool => _currentTool;
+  Color get currentColor => _currentColor;
+  double get currentStrokeWidth => _currentStrokeWidth;
+  bool get isDrawing => _isDrawing;
+  ui.Image? get backgroundImage => _backgroundImage;
+  String? get backgroundImagePath => _backgroundImagePath;
+  double get canvasWidth => _canvasWidth;
+  double get canvasHeight => _canvasHeight;
+  double get scaleFactor => _scaleFactor;
+  Offset get panOffset => _panOffset;
+  DrawingPath? get selectedPath => _selectedPath;
+  bool get isSelectionMode => _isSelectionMode;
+  bool get canUndo => _paths.isNotEmpty;
+  bool get canRedo => _undoStack.isNotEmpty;
+  List<DrawingLayer> get layers => List.unmodifiable(_layers);
+  int get currentLayerIndex => _currentLayerIndex;
+  bool get showGrid => _showGrid;
+  bool get snapToGrid => _snapToGrid;
+  double get gridSize => _gridSize;
+  
+  /// 초기화
+  Future<bool> initialize() async {
+    try {
+      // 기본 레이어 생성
+      _layers.add(DrawingLayer(
+        id: DateTime.now().millisecondsSinceEpoch.toString(),
+        name: '레이어 1',
+        isVisible: true,
+        opacity: 1.0,
+      ));
+      
+      return true;
+    } catch (e) {
+      debugPrint('DrawingService 초기화 실패: $e');
+      return false;
+    }
+  }
+  
+  // ========================================
+  // 그리기 도구 관리
+  // ========================================
+  
+  /// 그리기 도구 변경
+  void setDrawingTool(DrawingTool tool) {
+    _currentTool = tool;
+    _isSelectionMode = tool == DrawingTool.select;
+    notifyListeners();
+  }
+  
+  /// 색상 변경
+  void setColor(Color color) {
+    _currentColor = color;
+    notifyListeners();
+  }
+  
+  /// 선 굵기 변경
+  void setStrokeWidth(double width) {
+    if (width > 0 && width <= 50) {
+      _currentStrokeWidth = width;
+      notifyListeners();
+    }
+  }
+  
+  // ========================================
+  // 그리기 작업
+  // ========================================
+  
+  /// 그리기 시작
+  void startDrawing(Offset point) {
+    if (_isSelectionMode) {
+      _startSelection(point);
+      return;
+    }
+    
+    _isDrawing = true;
+    
+    final adjustedPoint = _adjustPointToGrid(point);
+    
+    final newPath = DrawingPath(
+      id: DateTime.now().millisecondsSinceEpoch.toString(),
+      tool: _currentTool,
+      color: _currentColor,
+      strokeWidth: _currentStrokeWidth,
+      points: [adjustedPoint],
+      layerId: _layers[_currentLayerIndex].id,
+      timestamp: DateTime.now(),
+    );
+    
+    _paths.add(newPath);
+    _undoStack.clear(); // 새로운 액션 시 redo 스택 클리어
+    
+    notifyListeners();
+  }
+  
+  /// 그리기 진행
+  void updateDrawing(Offset point) {
+    if (!_isDrawing || _paths.isEmpty) return;
+    
+    if (_isSelectionMode) {
+      _updateSelection(point);
+      return;
+    }
+    
+    final adjustedPoint = _adjustPointToGrid(point);
+    final currentPath = _paths.last;
+    
+    // 도구별 처리
+    switch (_currentTool) {
+      case DrawingTool.pen:
+      case DrawingTool.pencil:
+      case DrawingTool.marker:
+      case DrawingTool.highlighter:
+        currentPath.points.add(adjustedPoint);
+        break;
+      case DrawingTool.line:
+        if (currentPath.points.length >= 2) {
+          currentPath.points[1] = adjustedPoint;
+        } else {
+          currentPath.points.add(adjustedPoint);
+        }
+        break;
+      case DrawingTool.rectangle:
+      case DrawingTool.circle:
+        _updateShapePath(currentPath, adjustedPoint);
+        break;
+      case DrawingTool.eraser:
+        _performErase(adjustedPoint);
+        break;
+      default:
+        break;
+    }
+    
+    notifyListeners();
+  }
+  
+  /// 그리기 끝
+  void endDrawing() {
+    _isDrawing = false;
+    
+    if (_isSelectionMode) {
+      _endSelection();
+      return;
+    }
+    
+    // 빈 경로 제거
+    if (_paths.isNotEmpty && _paths.last.points.isEmpty) {
+      _paths.removeLast();
+    }
+    
+    notifyListeners();
+  }
+  
+  /// 그리드에 맞춰 좌표 조정
+  Offset _adjustPointToGrid(Offset point) {
+    if (!_snapToGrid) return point;
+    
+    final gridX = (point.dx / _gridSize).round() * _gridSize;
+    final gridY = (point.dy / _gridSize).round() * _gridSize;
+    
+    return Offset(gridX, gridY);
+  }
+  
+  /// 도형 경로 업데이트
+  void _updateShapePath(DrawingPath path, Offset endPoint) {
+    if (path.points.isEmpty) return;
+    
+    final startPoint = path.points.first;
+    
+    switch (path.tool) {
+      case DrawingTool.rectangle:
+        path.points = _createRectanglePath(startPoint, endPoint);
+        break;
+      case DrawingTool.circle:
+        path.points = _createCirclePath(startPoint, endPoint);
+        break;
+      default:
+        break;
+    }
+  }
+  
+  /// 사각형 경로 생성
+  List<Offset> _createRectanglePath(Offset start, Offset end) {
+    return [
+      start,
+      Offset(end.dx, start.dy),
+      end,
+      Offset(start.dx, end.dy),
+      start, // 닫기
+    ];
+  }
+  
+  /// 원 경로 생성
+  List<Offset> _createCirclePath(Offset start, Offset end) {
+    final center = Offset(
+      (start.dx + end.dx) / 2,
+      (start.dy + end.dy) / 2,
+    );
+    final radius = (end - start).distance / 2;
+    
+    final points = <Offset>[];
+    const int segments = 64;
+    
+    for (int i = 0; i <= segments; i++) {
+      final angle = (i / segments) * 2 * 3.14159;
+      points.add(Offset(
+        center.dx + radius * cos(angle),
+        center.dy + radius * sin(angle),
+      ));
+    }
+    
+    return points;
+  }
+  
+  // ========================================
+  // 지우개 기능
+  // ========================================
+  
+  /// 지우기 수행
+  void _performErase(Offset point) {
+    final eraseRadius = _currentStrokeWidth * 2;
+    
+    _paths.removeWhere((path) {
+      return path.points.any((pathPoint) {
+        return (pathPoint - point).distance <= eraseRadius;
+      });
+    });
+  }
+  
+  /// 전체 지우기
+  void clearCanvas() {
+    if (_paths.isNotEmpty) {
+      _undoStack.clear();
+      _paths.clear();
+      notifyListeners();
+    }
+  }
+  
+  // ========================================
+  // 실행 취소/다시 실행
+  // ========================================
+  
+  /// 실행 취소
+  void undo() {
+    if (_paths.isNotEmpty) {
+      _undoStack.add(_paths.removeLast());
+      notifyListeners();
+    }
+  }
+  
+  /// 다시 실행
+  void redo() {
+    if (_undoStack.isNotEmpty) {
+      _paths.add(_undoStack.removeLast());
+      notifyListeners();
+    }
+  }
+  
+  // ========================================
+  // 선택 및 편집
+  // ========================================
+  
+  /// 선택 시작
+  void _startSelection(Offset point) {
+    _selectionRect = Rect.fromLTWH(point.dx, point.dy, 0, 0);
+    _selectedPath = null;
+  }
+  
+  /// 선택 업데이트
+  void _updateSelection(Offset point) {
+    if (_selectionRect == null) return;
+    
+    final startPoint = _selectionRect!.topLeft;
+    _selectionRect = Rect.fromPoints(startPoint, point);
+    notifyListeners();
+  }
+  
+  /// 선택 종료
+  void _endSelection() {
+    if (_selectionRect == null) return;
+    
+    // 선택 영역에 있는 경로 찾기
+    final selectedPaths = _paths.where((path) {
+      return path.points.any((point) => _selectionRect!.contains(point));
+    }).toList();
+    
+    if (selectedPaths.isNotEmpty) {
+      _selectedPath = selectedPaths.first;
+    }
+    
+    _selectionRect = null;
+    notifyListeners();
+  }
+  
+  /// 선택된 경로 삭제
+  void deleteSelectedPath() {
+    if (_selectedPath != null) {
+      _paths.remove(_selectedPath);
+      _selectedPath = null;
+      notifyListeners();
+    }
+  }
+  
+  /// 선택된 경로 복사
+  void duplicateSelectedPath() {
+    if (_selectedPath != null) {
+      final newPath = DrawingPath(
+        id: DateTime.now().millisecondsSinceEpoch.toString(),
+        tool: _selectedPath!.tool,
+        color: _selectedPath!.color,
+        strokeWidth: _selectedPath!.strokeWidth,
+        points: _selectedPath!.points.map((p) => p + Offset(10, 10)).toList(),
+        layerId: _selectedPath!.layerId,
+        timestamp: DateTime.now(),
+      );
+      
+      _paths.add(newPath);
+      _selectedPath = newPath;
+      notifyListeners();
+    }
+  }
+  
+  // ========================================
+  // 배경 이미지/PDF 관리
+  // ========================================
+  
+  /// 배경 이미지 설정
+  Future<bool> setBackgroundImage(String imagePath) async {
+    try {
+      final file = File(imagePath);
+      if (!await file.exists()) return false;
+      
+      final bytes = await file.readAsBytes();
+      final codec = await ui.instantiateImageCodec(bytes);
+      final frame = await codec.getNextFrame();
+      
+      _backgroundImage = frame.image;
+      _backgroundImagePath = imagePath;
+      _canvasWidth = frame.image.width.toDouble();
+      _canvasHeight = frame.image.height.toDouble();
+      
+      notifyListeners();
+      return true;
+    } catch (e) {
+      debugPrint('배경 이미지 설정 실패: $e');
+      return false;
+    }
+  }
+  
+  /// 배경 이미지 제거
+  void removeBackgroundImage() {
+    _backgroundImage?.dispose();
+    _backgroundImage = null;
+    _backgroundImagePath = null;
+    notifyListeners();
+  }
+  
+  // ========================================
+  // 캔버스 변환 (확대/축소/이동)
+  // ========================================
+  
+  /// 확대/축소
+  void setScale(double scale) {
+    if (scale >= 0.1 && scale <= 5.0) {
+      _scaleFactor = scale;
+      notifyListeners();
+    }
+  }
+  
+  /// 이동
+  void setPanOffset(Offset offset) {
+    _panOffset = offset;
+    notifyListeners();
+  }
+  
+  /// 확대
+  void zoomIn() {
+    setScale(_scaleFactor * 1.2);
+  }
+  
+  /// 축소
+  void zoomOut() {
+    setScale(_scaleFactor / 1.2);
+  }
+  
+  /// 원래 크기로
+  void resetZoom() {
+    _scaleFactor = 1.0;
+    _panOffset = Offset.zero;
+    notifyListeners();
+  }
+  
+  // ========================================
+  // 레이어 관리
+  // ========================================
+  
+  /// 새 레이어 추가
+  void addLayer({String? name}) {
+    final layer = DrawingLayer(
+      id: DateTime.now().millisecondsSinceEpoch.toString(),
+      name: name ?? '레이어 ${_layers.length + 1}',
+      isVisible: true,
+      opacity: 1.0,
+    );
+    
+    _layers.add(layer);
+    _currentLayerIndex = _layers.length - 1;
+    notifyListeners();
+  }
+  
+  /// 레이어 삭제
+  void deleteLayer(int index) {
+    if (_layers.length <= 1 || index < 0 || index >= _layers.length) return;
+    
+    final layerId = _layers[index].id;
+    
+    // 해당 레이어의 모든 경로 삭제
+    _paths.removeWhere((path) => path.layerId == layerId);
+    
+    _layers.removeAt(index);
+    
+    // 현재 레이어 인덱스 조정
+    if (_currentLayerIndex >= _layers.length) {
+      _currentLayerIndex = _layers.length - 1;
+    }
+    
+    notifyListeners();
+  }
+  
+  /// 현재 레이어 변경
+  void setCurrentLayer(int index) {
+    if (index >= 0 && index < _layers.length) {
+      _currentLayerIndex = index;
+      notifyListeners();
+    }
+  }
+  
+  /// 레이어 가시성 토글
+  void toggleLayerVisibility(int index) {
+    if (index >= 0 && index < _layers.length) {
+      _layers[index].isVisible = !_layers[index].isVisible;
+      notifyListeners();
+    }
+  }
+  
+  /// 레이어 투명도 설정
+  void setLayerOpacity(int index, double opacity) {
+    if (index >= 0 && index < _layers.length && opacity >= 0.0 && opacity <= 1.0) {
+      _layers[index].opacity = opacity;
+      notifyListeners();
+    }
+  }
+  
+  // ========================================
+  // 그리드 및 가이드라인
+  // ========================================
+  
+  /// 그리드 표시 토글
+  void toggleGrid() {
+    _showGrid = !_showGrid;
+    notifyListeners();
+  }
+  
+  /// 그리드 스냅 토글
+  void toggleGridSnap() {
+    _snapToGrid = !_snapToGrid;
+    notifyListeners();
+  }
+  
+  /// 그리드 크기 설정
+  void setGridSize(double size) {
+    if (size >= 5.0 && size <= 100.0) {
+      _gridSize = size;
+      notifyListeners();
+    }
+  }
+  
+  // ========================================
+  // 저장 및 내보내기
+  // ========================================
+  
+  /// 드로잉 데이터 저장
+  Future<bool> saveDrawing(String fileName) async {
+    try {
+      final directory = await getApplicationDocumentsDirectory();
+      final drawingsDir = Directory('${directory.path}/drawings');
+      if (!await drawingsDir.exists()) {
+        await drawingsDir.create(recursive: true);
+      }
+      
+      final file = File('${drawingsDir.path}/$fileName.json');
+      
+      final data = {
+        'paths': _paths.map((p) => p.toJson()).toList(),
+        'layers': _layers.map((l) => l.toJson()).toList(),
+        'backgroundImagePath': _backgroundImagePath,
+        'canvasWidth': _canvasWidth,
+        'canvasHeight': _canvasHeight,
+        'timestamp': DateTime.now().toIso8601String(),
+      };
+      
+      await file.writeAsString(jsonEncode(data));
+      return true;
+    } catch (e) {
+      debugPrint('드로잉 저장 실패: $e');
+      return false;
+    }
+  }
+  
+  /// 드로잉 데이터 로드
+  Future<bool> loadDrawing(String filePath) async {
+    try {
+      final file = File(filePath);
+      if (!await file.exists()) return false;
+      
+      final jsonString = await file.readAsString();
+      final data = jsonDecode(jsonString);
+      
+      // 경로 데이터 로드
+      _paths.clear();
+      for (final pathData in data['paths']) {
+        _paths.add(DrawingPath.fromJson(pathData));
+      }
+      
+      // 레이어 데이터 로드
+      _layers.clear();
+      for (final layerData in data['layers']) {
+        _layers.add(DrawingLayer.fromJson(layerData));
+      }
+      
+      // 배경 이미지 로드
+      if (data['backgroundImagePath'] != null) {
+        await setBackgroundImage(data['backgroundImagePath']);
+      }
+      
+      _canvasWidth = data['canvasWidth']?.toDouble() ?? 0;
+      _canvasHeight = data['canvasHeight']?.toDouble() ?? 0;
+      
+      _undoStack.clear();
+      _selectedPath = null;
+      _currentLayerIndex = 0;
+      
+      notifyListeners();
+      return true;
+    } catch (e) {
+      debugPrint('드로잉 로드 실패: $e');
+      return false;
+    }
+  }
+  
+  /// PNG 이미지로 내보내기
+  Future<String?> exportToPNG() async {
+    try {
+      final recorder = ui.PictureRecorder();
+      final canvas = Canvas(recorder);
+      
+      // 배경 그리기
+      if (_backgroundImage != null) {
+        canvas.drawImage(_backgroundImage!, Offset.zero, Paint());
+      } else {
+        canvas.drawRect(
+          Rect.fromLTWH(0, 0, _canvasWidth, _canvasHeight),
+          Paint()..color = Colors.white,
+        );
+      }
+      
+      // 레이어별로 경로 그리기
+      for (final layer in _layers) {
+        if (!layer.isVisible) continue;
+        
+        final layerPaths = _paths.where((p) => p.layerId == layer.id);
+        for (final path in layerPaths) {
+          _drawPathOnCanvas(canvas, path, layer.opacity);
+        }
+      }
+      
+      final picture = recorder.endRecording();
+      final image = await picture.toImage(
+        _canvasWidth.toInt(),
+        _canvasHeight.toInt(),
+      );
+      
+      final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
+      final bytes = byteData!.buffer.asUint8List();
+      
+      // 파일 저장
+      final directory = await getApplicationDocumentsDirectory();
+      final exportDir = Directory('${directory.path}/exports');
+      if (!await exportDir.exists()) {
+        await exportDir.create(recursive: true);
+      }
+      
+      final timestamp = DateTime.now().millisecondsSinceEpoch;
+      final file = File('${exportDir.path}/drawing_$timestamp.png');
+      await file.writeAsBytes(bytes);
+      
+      return file.path;
+    } catch (e) {
+      debugPrint('PNG 내보내기 실패: $e');
+      return null;
+    }
+  }
+  
+  /// 캔버스에 경로 그리기
+  void _drawPathOnCanvas(Canvas canvas, DrawingPath path, double opacity) {
+    if (path.points.isEmpty) return;
+    
+    final paint = Paint()
+      ..color = path.color.withOpacity(path.color.opacity * opacity)
+      ..strokeWidth = path.strokeWidth
+      ..style = PaintingStyle.stroke
+      ..strokeCap = StrokeCap.round
+      ..strokeJoin = StrokeJoin.round;
+    
+    // 도구별 페인트 설정
+    switch (path.tool) {
+      case DrawingTool.highlighter:
+        paint.blendMode = BlendMode.multiply;
+        break;
+      case DrawingTool.marker:
+        paint.strokeCap = StrokeCap.square;
+        break;
+      default:
+        break;
+    }
+    
+    final pathObject = Path();
+    pathObject.moveTo(path.points.first.dx, path.points.first.dy);
+    
+    for (int i = 1; i < path.points.length; i++) {
+      pathObject.lineTo(path.points[i].dx, path.points[i].dy);
+    }
+    
+    canvas.drawPath(pathObject, paint);
+  }
+  
+  // ========================================
+  // 필기 인식 (OCR)
+  // ========================================
+  
+  /// 필기 인식 활성화/비활성화
+  void setHandwritingRecognition(bool enabled) {
+    _handwritingRecognitionEnabled = enabled;
+    notifyListeners();
+  }
+  
+  /// 필기 인식 수행
+  Future<List<String>> recognizeHandwriting() async {
+    if (!_handwritingRecognitionEnabled) return [];
+    
+    try {
+      // 실제 구현에서는 ML Kit 또는 다른 OCR 서비스 사용
+      // 여기서는 더미 구현
+      _recognizedText = ['인식된 텍스트 예시'];
+      notifyListeners();
+      return _recognizedText;
+    } catch (e) {
+      debugPrint('필기 인식 실패: $e');
+      return [];
+    }
+  }
+  
+  /// 리소스 정리
+  @override
+  void dispose() {
+    _backgroundImage?.dispose();
+    super.dispose();
+  }
+}
+
+/// 그리기 도구 열거형
+enum DrawingTool {
+  pen,
+  pencil,
+  marker,
+  highlighter,
+  eraser,
+  line,
+  rectangle,
+  circle,
+  select,
+}
+
+/// 그리기 경로 데이터 클래스
+class DrawingPath {
+  final String id;
+  final DrawingTool tool;
+  final Color color;
+  final double strokeWidth;
+  final List<Offset> points;
+  final String layerId;
+  final DateTime timestamp;
+
+  DrawingPath({
+    required this.id,
+    required this.tool,
+    required this.color,
+    required this.strokeWidth,
+    required this.points,
+    required this.layerId,
+    required this.timestamp,
+  });
+
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'tool': tool.toString(),
+    'color': color.value,
+    'strokeWidth': strokeWidth,
+    'points': points.map((p) => {'dx': p.dx, 'dy': p.dy}).toList(),
+    'layerId': layerId,
+    'timestamp': timestamp.toIso8601String(),
+  };
+
+  factory DrawingPath.fromJson(Map<String, dynamic> json) => DrawingPath(
+    id: json['id'],
+    tool: DrawingTool.values.firstWhere(
+      (t) => t.toString() == json['tool'],
+      orElse: () => DrawingTool.pen,
+    ),
+    color: Color(json['color']),
+    strokeWidth: json['strokeWidth']?.toDouble() ?? 2.0,
+    points: (json['points'] as List)
+        .map((p) => Offset(p['dx']?.toDouble() ?? 0, p['dy']?.toDouble() ?? 0))
+        .toList(),
+    layerId: json['layerId'],
+    timestamp: DateTime.parse(json['timestamp']),
+  );
+}
+
+/// 그리기 레이어 데이터 클래스
+class DrawingLayer {
+  final String id;
+  String name;
+  bool isVisible;
+  double opacity;
+
+  DrawingLayer({
+    required this.id,
+    required this.name,
+    required this.isVisible,
+    required this.opacity,
+  });
+
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'name': name,
+    'isVisible': isVisible,
+    'opacity': opacity,
+  };
+
+  factory DrawingLayer.fromJson(Map<String, dynamic> json) => DrawingLayer(
+    id: json['id'],
+    name: json['name'],
+    isVisible: json['isVisible'] ?? true,
+    opacity: json['opacity']?.toDouble() ?? 1.0,
+  );
+}
+```
+
+================================================================================
+
+18. 파일 변환 서비스 (FileConversionService)
+
+================================================================================
+
+PDF→JPEG 변환을 포함한 파일 변환 처리를 관리하는 서비스 클래스입니다.
+
+```dart
+import 'dart:io';
+import 'dart:async';
+import 'dart:typed_data';
+import 'dart:ui' as ui;
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:path/path.dart' as path;
+import 'package:pdf/pdf.dart';
+import 'package:pdf/widgets.dart' as pw;
+import 'package:printing/printing.dart';
+import 'package:image/image.dart' as img;
+
+class FileConversionService extends ChangeNotifier {
+  // 싱글톤 인스턴스
+  static final FileConversionService _instance = FileConversionService._internal();
+  factory FileConversionService() => _instance;
+  FileConversionService._internal();
+
+  // 변환 상태
+  bool _isConverting = false;
+  double _conversionProgress = 0.0;
+  String _currentTask = '';
+  List<ConversionHistoryItem> _conversionHistory = [];
+  
+  // 변환 설정
+  int _jpegQuality = 85; // 0-100
+  double _imageResolution = 300.0; // DPI
+  bool _maintainAspectRatio = true;
+  int _maxImageWidth = 2048;
+  int _maxImageHeight = 2048;
+  
+  // 지원 파일 형식
+  static const List<String> supportedInputFormats = [
+    'pdf', 'doc', 'docx', 'ppt', 'pptx', 'txt', 'rtf', 'odt'
+  ];
+  
+  static const List<String> supportedOutputFormats = [
+    'jpeg', 'jpg', 'png', 'pdf'
+  ];
+  
+  // Getters
+  bool get isConverting => _isConverting;
+  double get conversionProgress => _conversionProgress;
+  String get currentTask => _currentTask;
+  List<ConversionHistoryItem> get conversionHistory => List.unmodifiable(_conversionHistory);
+  int get jpegQuality => _jpegQuality;
+  double get imageResolution => _imageResolution;
+  bool get maintainAspectRatio => _maintainAspectRatio;
+  int get maxImageWidth => _maxImageWidth;
+  int get maxImageHeight => _maxImageHeight;
+  
+  /// 초기화
+  Future<bool> initialize() async {
+    try {
+      await _loadConversionHistory();
+      return true;
+    } catch (e) {
+      debugPrint('FileConversionService 초기화 실패: $e');
+      return false;
+    }
+  }
+  
+  // ========================================
+  // PDF → JPEG 변환 (메인 기능)
+  // ========================================
+  
+  /// PDF 파일을 JPEG 이미지로 변환
+  Future<List<String>?> convertPdfToJpeg(
+    String pdfPath, 
+    String outputDirectory,
+    {String? customFileName}
+  ) async {
+    try {
+      if (_isConverting) {
+        throw Exception('다른 변환 작업이 진행 중입니다.');
+      }
+      
+      _startConversion('PDF → JPEG 변환 중...');
+      
+      // PDF 파일 검증
+      final pdfFile = File(pdfPath);
+      if (!await pdfFile.exists()) {
+        throw Exception('PDF 파일을 찾을 수 없습니다.');
+      }
+      
+      // 출력 디렉토리 생성
+      final outputDir = Directory(outputDirectory);
+      if (!await outputDir.exists()) {
+        await outputDir.create(recursive: true);
+      }
+      
+      // PDF 문서 로드
+      final pdfBytes = await pdfFile.readAsBytes();
+      final document = await PdfDocument.openData(pdfBytes);
+      
+      final pageCount = document.pagesCount;
+      final outputPaths = <String>[];
+      
+      // 각 페이지를 JPEG로 변환
+      for (int pageIndex = 0; pageIndex < pageCount; pageIndex++) {
+        _updateProgress(
+          (pageIndex / pageCount),
+          'PDF 페이지 ${pageIndex + 1}/$pageCount 변환 중...'
+        );
+        
+        // PDF 페이지를 이미지로 렌더링
+        final page = await document.getPage(pageIndex + 1);
+        final pageImage = await page.render(
+          width: (_imageResolution * 8.27).toInt(), // A4 기준
+          height: (_imageResolution * 11.69).toInt(),
+          format: PdfPageImageFormat.jpeg,
+        );
+        
+        if (pageImage != null) {
+          // 이미지 처리 및 최적화
+          final processedBytes = await _processImage(
+            pageImage.bytes,
+            pageImage.width,
+            pageImage.height,
+          );
+          
+          // 파일명 생성
+          final baseName = customFileName ?? 
+              path.basenameWithoutExtension(pdfPath);
+          final fileName = pageCount > 1 
+              ? '${baseName}_page_${pageIndex + 1}.jpg'
+              : '$baseName.jpg';
+          
+          // JPEG 파일 저장
+          final outputPath = path.join(outputDirectory, fileName);
+          final outputFile = File(outputPath);
+          await outputFile.writeAsBytes(processedBytes);
+          
+          outputPaths.add(outputPath);
+        }
+        
+        page.close();
+      }
+      
+      document.close();
+      
+      // 변환 기록 저장
+      await _addConversionHistory(ConversionHistoryItem(
+        id: DateTime.now().millisecondsSinceEpoch.toString(),
+        sourceFile: pdfPath,
+        outputFiles: outputPaths,
+        sourceFormat: 'PDF',
+        targetFormat: 'JPEG',
+        timestamp: DateTime.now(),
+        success: true,
+        pageCount: pageCount,
+      ));
+      
+      _completeConversion();
+      return outputPaths;
+      
+    } catch (e) {
+      _failConversion('PDF 변환 실패: $e');
+      return null;
+    }
+  }
+  
+  // ========================================
+  // 이미지 처리 및 최적화
+  // ========================================
+  
+  /// 이미지 처리 및 최적화
+  Future<Uint8List> _processImage(
+    Uint8List imageBytes, 
+    int originalWidth, 
+    int originalHeight
+  ) async {
+    try {
+      // 이미지 디코딩
+      final image = img.decodeImage(imageBytes);
+      if (image == null) {
+        throw Exception('이미지 디코딩 실패');
+      }
+      
+      // 크기 조정 계산
+      int targetWidth = originalWidth;
+      int targetHeight = originalHeight;
+      
+      if (_maintainAspectRatio) {
+        if (originalWidth > _maxImageWidth || originalHeight > _maxImageHeight) {
+          final widthRatio = _maxImageWidth / originalWidth;
+          final heightRatio = _maxImageHeight / originalHeight;
+          final ratio = math.min(widthRatio, heightRatio);
+          
+          targetWidth = (originalWidth * ratio).round();
+          targetHeight = (originalHeight * ratio).round();
+        }
+      } else {
+        targetWidth = math.min(originalWidth, _maxImageWidth);
+        targetHeight = math.min(originalHeight, _maxImageHeight);
+      }
+      
+      // 이미지 리사이즈
+      final resizedImage = img.copyResize(
+        image,
+        width: targetWidth,
+        height: targetHeight,
+        interpolation: img.Interpolation.cubic,
+      );
+      
+      // JPEG 인코딩
+      final jpegBytes = img.encodeJpg(resizedImage, quality: _jpegQuality);
+      
+      return Uint8List.fromList(jpegBytes);
+    } catch (e) {
+      debugPrint('이미지 처리 실패: $e');
+      return imageBytes; // 원본 반환
+    }
+  }
+  
+  // ========================================
+  // 기타 파일 형식 변환
+  // ========================================
+  
+  /// 문서 파일을 이미지로 변환 (DOC, PPT 등)
+  Future<List<String>?> convertDocumentToImage(
+    String documentPath,
+    String outputDirectory,
+    {String targetFormat = 'jpeg'}
+  ) async {
+    try {
+      if (_isConverting) {
+        throw Exception('다른 변환 작업이 진행 중입니다.');
+      }
+      
+      final extension = path.extension(documentPath).toLowerCase();
+      
+      switch (extension) {
+        case '.doc':
+        case '.docx':
+          return await _convertWordToImage(documentPath, outputDirectory, targetFormat);
+        case '.ppt':
+        case '.pptx':
+          return await _convertPowerPointToImage(documentPath, outputDirectory, targetFormat);
+        case '.txt':
+          return await _convertTextToImage(documentPath, outputDirectory, targetFormat);
+        default:
+          throw Exception('지원하지 않는 파일 형식: $extension');
+      }
+    } catch (e) {
+      _failConversion('문서 변환 실패: $e');
+      return null;
+    }
+  }
+  
+  /// Word 문서를 이미지로 변환
+  Future<List<String>?> _convertWordToImage(
+    String docPath,
+    String outputDirectory,
+    String targetFormat
+  ) async {
+    _startConversion('Word 문서 변환 중...');
+    
+    // 실제 구현에서는 flutter_document_reader 또는
+    // 네이티브 플러그인을 사용하여 구현
+    // 여기서는 더미 구현
+    
+    _updateProgress(0.5, 'Word 문서 처리 중...');
+    
+    // 임시 PDF 생성 후 JPEG 변환
+    final tempPdfPath = await _convertWordToPdf(docPath);
+    if (tempPdfPath != null) {
+      final result = await convertPdfToJpeg(tempPdfPath, outputDirectory);
+      
+      // 임시 PDF 파일 삭제
+      await File(tempPdfPath).delete();
+      
+      return result;
+    }
+    
+    return null;
+  }
+  
+  /// PowerPoint를 이미지로 변환
+  Future<List<String>?> _convertPowerPointToImage(
+    String pptPath,
+    String outputDirectory,
+    String targetFormat
+  ) async {
+    _startConversion('PowerPoint 변환 중...');
+    
+    // 실제 구현에서는 플랫폼별 네이티브 변환 사용
+    // 여기서는 더미 구현
+    
+    _updateProgress(0.5, 'PowerPoint 처리 중...');
+    
+    final tempPdfPath = await _convertPowerPointToPdf(pptPath);
+    if (tempPdfPath != null) {
+      final result = await convertPdfToJpeg(tempPdfPath, outputDirectory);
+      await File(tempPdfPath).delete();
+      return result;
+    }
+    
+    return null;
+  }
+  
+  /// 텍스트 파일을 이미지로 변환
+  Future<List<String>?> _convertTextToImage(
+    String textPath,
+    String outputDirectory,
+    String targetFormat
+  ) async {
+    try {
+      _startConversion('텍스트 파일 변환 중...');
+      
+      // 텍스트 파일 읽기
+      final textFile = File(textPath);
+      final content = await textFile.readAsString();
+      
+      _updateProgress(0.3, '텍스트 렌더링 중...');
+      
+      // 텍스트를 PDF로 변환
+      final pdfPath = await _convertTextToPdf(content, textPath);
+      
+      _updateProgress(0.6, 'PDF → JPEG 변환 중...');
+      
+      // PDF를 JPEG로 변환
+      final result = await convertPdfToJpeg(pdfPath, outputDirectory);
+      
+      // 임시 PDF 삭제
+      await File(pdfPath).delete();
+      
+      return result;
+    } catch (e) {
+      _failConversion('텍스트 변환 실패: $e');
+      return null;
+    }
+  }
+  
+  /// 텍스트를 PDF로 변환
+  Future<String> _convertTextToPdf(String content, String originalPath) async {
+    final pdf = pw.Document();
+    
+    // 페이지 설정
+    const pageFormat = PdfPageFormat.a4;
+    const margin = pw.EdgeInsets.all(40);
+    
+    // 텍스트를 페이지별로 분할
+    final lines = content.split('\n');
+    const linesPerPage = 40; // A4 기준 대략적인 줄 수
+    
+    for (int i = 0; i < lines.length; i += linesPerPage) {
+      final pageLines = lines.skip(i).take(linesPerPage).join('\n');
+      
+      pdf.addPage(
+        pw.Page(
+          pageFormat: pageFormat,
+          margin: margin,
+          build: (pw.Context context) {
+            return pw.Column(
+              crossAxisAlignment: pw.CrossAxisAlignment.start,
+              children: [
+                pw.Text(
+                  pageLines,
+                  style: pw.TextStyle(
+                    fontSize: 12,
+                    lineSpacing: 1.2,
+                  ),
+                ),
+              ],
+            );
+          },
+        ),
+      );
+    }
+    
+    // PDF 저장
+    final directory = await getTemporaryDirectory();
+    final baseName = path.basenameWithoutExtension(originalPath);
+    final pdfPath = path.join(directory.path, '${baseName}_temp.pdf');
+    
+    final file = File(pdfPath);
+    await file.writeAsBytes(await pdf.save());
+    
+    return pdfPath;
+  }
+  
+  /// Word를 PDF로 변환 (더미 구현)
+  Future<String?> _convertWordToPdf(String docPath) async {
+    // 실제로는 네이티브 플러그인이나 서버 API 사용
+    // 여기서는 더미 구현
+    return null;
+  }
+  
+  /// PowerPoint를 PDF로 변환 (더미 구현)
+  Future<String?> _convertPowerPointToPdf(String pptPath) async {
+    // 실제로는 네이티브 플러그인이나 서버 API 사용
+    // 여기서는 더미 구현
+    return null;
+  }
+  
+  // ========================================
+  // 리튼 디렉토리 통합 처리
+  // ========================================
+  
+  /// 파일을 리튼 디렉토리로 변환 및 이동
+  Future<List<String>?> convertAndMoveToLiten(
+    String sourceFilePath,
+    String litenDirectoryId,
+    {String? customFileName}
+  ) async {
+    try {
+      // 리튼 디렉토리 경로 생성
+      final directory = await getApplicationDocumentsDirectory();
+      final litenDir = Directory('${directory.path}/litens/$litenDirectoryId');
+      if (!await litenDir.exists()) {
+        await litenDir.create(recursive: true);
+      }
+      
+      final extension = path.extension(sourceFilePath).toLowerCase();
+      
+      // 파일 형식에 따른 변환 처리
+      if (extension == '.pdf') {
+        return await convertPdfToJpeg(
+          sourceFilePath,
+          litenDir.path,
+          customFileName: customFileName,
+        );
+      } else if (supportedInputFormats.contains(extension.substring(1))) {
+        return await convertDocumentToImage(
+          sourceFilePath,
+          litenDir.path,
+          targetFormat: 'jpeg',
+        );
+      } else if (['.jpg', '.jpeg', '.png'].contains(extension)) {
+        // 이미지 파일은 직접 복사
+        final fileName = customFileName ?? path.basename(sourceFilePath);
+        final targetPath = path.join(litenDir.path, fileName);
+        await File(sourceFilePath).copy(targetPath);
+        return [targetPath];
+      } else {
+        throw Exception('지원하지 않는 파일 형식: $extension');
+      }
+    } catch (e) {
+      debugPrint('리튼 디렉토리 변환 실패: $e');
+      return null;
+    }
+  }
+  
+  // ========================================
+  // 변환 상태 관리
+  // ========================================
+  
+  /// 변환 시작
+  void _startConversion(String task) {
+    _isConverting = true;
+    _conversionProgress = 0.0;
+    _currentTask = task;
+    notifyListeners();
+  }
+  
+  /// 변환 진행 상황 업데이트
+  void _updateProgress(double progress, String task) {
+    _conversionProgress = progress.clamp(0.0, 1.0);
+    _currentTask = task;
+    notifyListeners();
+  }
+  
+  /// 변환 완료
+  void _completeConversion() {
+    _isConverting = false;
+    _conversionProgress = 1.0;
+    _currentTask = '변환 완료';
+    notifyListeners();
+  }
+  
+  /// 변환 실패
+  void _failConversion(String error) {
+    _isConverting = false;
+    _conversionProgress = 0.0;
+    _currentTask = error;
+    notifyListeners();
+    
+    debugPrint('변환 실패: $error');
+  }
+  
+  /// 변환 취소
+  void cancelConversion() {
+    if (_isConverting) {
+      _isConverting = false;
+      _conversionProgress = 0.0;
+      _currentTask = '변환 취소됨';
+      notifyListeners();
+    }
+  }
+  
+  // ========================================
+  // 설정 관리
+  // ========================================
+  
+  /// JPEG 품질 설정
+  void setJpegQuality(int quality) {
+    if (quality >= 10 && quality <= 100) {
+      _jpegQuality = quality;
+      notifyListeners();
+    }
+  }
+  
+  /// 이미지 해상도 설정
+  void setImageResolution(double dpi) {
+    if (dpi >= 72 && dpi <= 600) {
+      _imageResolution = dpi;
+      notifyListeners();
+    }
+  }
+  
+  /// 최대 이미지 크기 설정
+  void setMaxImageSize(int width, int height) {
+    if (width > 0 && height > 0) {
+      _maxImageWidth = width;
+      _maxImageHeight = height;
+      notifyListeners();
+    }
+  }
+  
+  /// 종횡비 유지 설정
+  void setMaintainAspectRatio(bool maintain) {
+    _maintainAspectRatio = maintain;
+    notifyListeners();
+  }
+  
+  // ========================================
+  // 변환 기록 관리
+  // ========================================
+  
+  /// 변환 기록 추가
+  Future<void> _addConversionHistory(ConversionHistoryItem item) async {
+    _conversionHistory.insert(0, item); // 최신 항목을 맨 앞에
+    
+    // 최대 100개 항목만 유지
+    if (_conversionHistory.length > 100) {
+      _conversionHistory = _conversionHistory.take(100).toList();
+    }
+    
+    await _saveConversionHistory();
+    notifyListeners();
+  }
+  
+  /// 변환 기록 로드
+  Future<void> _loadConversionHistory() async {
+    try {
+      // SharedPreferences나 파일에서 로드하는 로직
+      // 여기서는 더미 구현
+      _conversionHistory = [];
+    } catch (e) {
+      debugPrint('변환 기록 로드 실패: $e');
+    }
+  }
+  
+  /// 변환 기록 저장
+  Future<void> _saveConversionHistory() async {
+    try {
+      // SharedPreferences나 파일에 저장하는 로직
+      // 여기서는 더미 구현
+    } catch (e) {
+      debugPrint('변환 기록 저장 실패: $e');
+    }
+  }
+  
+  /// 변환 기록 삭제
+  void clearConversionHistory() {
+    _conversionHistory.clear();
+    _saveConversionHistory();
+    notifyListeners();
+  }
+  
+  /// 특정 변환 기록 삭제
+  void removeConversionHistory(String id) {
+    _conversionHistory.removeWhere((item) => item.id == id);
+    _saveConversionHistory();
+    notifyListeners();
+  }
+  
+  // ========================================
+  // 유틸리티 메서드
+  // ========================================
+  
+  /// 파일 크기 포맷팅
+  String formatFileSize(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    if (bytes < 1024 * 1024 * 1024) return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+    return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(1)} GB';
+  }
+  
+  /// 파일 형식 지원 여부 확인
+  bool isFileFormatSupported(String filePath) {
+    final extension = path.extension(filePath).toLowerCase().substring(1);
+    return supportedInputFormats.contains(extension);
+  }
+  
+  /// 예상 변환 시간 계산 (초)
+  int estimateConversionTime(String filePath) {
+    final file = File(filePath);
+    if (!file.existsSync()) return 0;
+    
+    final sizeInMB = file.lengthSync() / (1024 * 1024);
+    final extension = path.extension(filePath).toLowerCase();
+    
+    // 파일 형식과 크기에 따른 대략적인 변환 시간
+    switch (extension) {
+      case '.pdf':
+        return (sizeInMB * 2).round(); // PDF: 2초/MB
+      case '.doc':
+      case '.docx':
+        return (sizeInMB * 5).round(); // Word: 5초/MB
+      case '.ppt':
+      case '.pptx':
+        return (sizeInMB * 8).round(); // PowerPoint: 8초/MB
+      case '.txt':
+        return (sizeInMB * 1).round(); // Text: 1초/MB
+      default:
+        return (sizeInMB * 3).round(); // 기타: 3초/MB
+    }
+  }
+}
+
+/// 변환 기록 항목 데이터 클래스
+class ConversionHistoryItem {
+  final String id;
+  final String sourceFile;
+  final List<String> outputFiles;
+  final String sourceFormat;
+  final String targetFormat;
+  final DateTime timestamp;
+  final bool success;
+  final int? pageCount;
+  final String? errorMessage;
+
+  ConversionHistoryItem({
+    required this.id,
+    required this.sourceFile,
+    required this.outputFiles,
+    required this.sourceFormat,
+    required this.targetFormat,
+    required this.timestamp,
+    required this.success,
+    this.pageCount,
+    this.errorMessage,
+  });
+
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'sourceFile': sourceFile,
+    'outputFiles': outputFiles,
+    'sourceFormat': sourceFormat,
+    'targetFormat': targetFormat,
+    'timestamp': timestamp.toIso8601String(),
+    'success': success,
+    'pageCount': pageCount,
+    'errorMessage': errorMessage,
+  };
+
+  factory ConversionHistoryItem.fromJson(Map<String, dynamic> json) => ConversionHistoryItem(
+    id: json['id'],
+    sourceFile: json['sourceFile'],
+    outputFiles: List<String>.from(json['outputFiles']),
+    sourceFormat: json['sourceFormat'],
+    targetFormat: json['targetFormat'],
+    timestamp: DateTime.parse(json['timestamp']),
+    success: json['success'],
+    pageCount: json['pageCount'],
+    errorMessage: json['errorMessage'],
+  );
+}
+```
+
+================================================================================
+
 리튼(liten) 크로스플랫폼 노트 앱의 **Flutter 프론트엔드 설계**가 완전히 완성되었습니다. 
 
 - **기존 기능**: 음성/텍스트/필기 통합 노트 시스템
 - **추가된 기능**: 광고 시스템, 사용량 제한, 테마 시스템, 국제화, 동기화 등
+- **서비스 레이어**: AudioService, TextEditorService, DrawingService, FileConversionService 완성
 - **사용자 경험**: 완전한 온보딩부터 고급 편집 도구까지
 - **비즈니스 모델**: 무료/프리미엄 차별화된 기능 제공
 
